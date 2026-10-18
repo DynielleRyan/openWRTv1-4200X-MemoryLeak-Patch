@@ -1,0 +1,119 @@
+name: Build MX4200 v1 (OpenWrt + ath11k RX ring fix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: "OpenWrt release to build (must match what the routers run)"
+        default: "25.12.5"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+  DEVICE: linksys_mx4200v1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools python3-dev rsync swig unzip zlib1g-dev \
+            file wget zstd
+
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Check out OpenWrt v${{ inputs.openwrt_version }}
+        run: |
+          git clone --depth 1 --branch v${{ inputs.openwrt_version }} https://github.com/openwrt/openwrt.git openwrt
+
+      - name: Feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add ath11k RX ring patch
+        run: |
+          mkdir -p openwrt/package/kernel/mac80211/patches/ath11k
+          cp patches/950-ath11k-shrink-rx-rings.patch openwrt/package/kernel/mac80211/patches/ath11k/
+
+      - name: Config (official release config, MX4200 v1 only)
+        working-directory: openwrt
+        run: |
+          V=${{ inputs.openwrt_version }}
+          # Start from the official release config so the kernel matches and official packages stay installable
+          wget -q "https://downloads.openwrt.org/releases/$V/targets/$TARGET/$SUBTARGET/config.buildinfo" -O .config
+          # Build only the MX4200 v1 image
+          sed -i -e '/CONFIG_TARGET_MULTI_PROFILE/d' -e '/CONFIG_TARGET_ALL_PROFILES/d' \
+                 -e '/CONFIG_TARGET_DEVICE_/d' -e '/CONFIG_TARGET_PER_DEVICE_ROOTFS/d' \
+                 -e '/CONFIG_ALL_KMODS/d' -e '/CONFIG_ALL_NONSHARED/d' -e '/CONFIG_SDK/d' \
+                 -e '/CONFIG_IB=/d' -e '/CONFIG_MAKE_TOOLCHAIN/d' -e '/CONFIG_COLLECT_KERNEL_DEBUG/d' .config
+          cat >> .config <<EOF
+          CONFIG_TARGET_${TARGET}=y
+          CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
+          CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE}=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_zram-swap=y
+          CONFIG_PACKAGE_luci-app-watchcat=y
+          EOF
+          sed -i 's/^[ \t]*//' .config
+          make defconfig
+          grep -E "DEVICE_${DEVICE}|CONFIG_VERSION_NUMBER|PACKAGE_kmod-ath11k=" .config
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j8 || make download -j1 V=s
+
+      - name: Verify patch is applied
+        working-directory: openwrt
+        run: |
+          make package/kernel/mac80211/prepare -j$(nproc) || make package/kernel/mac80211/prepare -j1 V=s
+          f=$(find build_dir -path '*backports-*/drivers/net/wireless/ath/ath11k/dp.h' | head -1)
+          echo "$f"
+          grep -E "define DP_RXDMA_(BUF|REFILL|MON_STATUS|MONITOR_BUF|MONITOR_DST|MONITOR_DESC)_RING_SIZE" "$f"
+          grep -qE "define DP_RXDMA_BUF_RING_SIZE[[:space:]]+2048" "$f"
+          grep -qE "define DP_RXDMA_MON_STATUS_RING_SIZE[[:space:]]+512" "$f"
+          grep -qE "define DP_RXDMA_REFILL_RING_SIZE[[:space:]]+2048" "$f"
+          echo "PATCH OK"
+
+      - name: Build
+        working-directory: openwrt
+        run: |
+          make -j$(($(nproc)+1)) || make -j1 V=s
+
+      - name: Collect files
+        run: |
+          mkdir -p out
+          cp openwrt/bin/targets/$TARGET/$SUBTARGET/*${DEVICE}*sysupgrade* out/
+          find openwrt/bin -name 'kmod-ath11k*.apk' -exec cp {} out/ \;
+          (cd out && sha256sum * > sha256sums.txt)
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx4200v1-openwrt-${{ inputs.openwrt_version }}-ath11k-fix
+          path: out/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ inputs.openwrt_version }}-ath11kfix-${{ github.run_number }}"
+          gh release create "$TAG" out/* --title "MX4200 v1 · OpenWrt ${{ inputs.openwrt_version }} + ath11k RX ring fix (#${{ github.run_number }})" \
+            --notes "Official OpenWrt ${{ inputs.openwrt_version }} config for Linksys MX4200 v1, plus a patch halving five ath11k RX/monitor ring sizes (refill buffer kept at 2048) to stop RAM exhaustion (openwrt/openwrt#24154). Not an official build. Flash the *sysupgrade.bin* from an existing OpenWrt install, keeping settings."
