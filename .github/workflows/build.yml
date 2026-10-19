@@ -1,4 +1,4 @@
-name: Build MX4200 v1 (OpenWrt + ath11k RX ring fix)
+name: Build MX4200 v1 (OpenWrt + ath11k RX ring fix + mesh)
 
 on:
   workflow_dispatch:
@@ -70,10 +70,24 @@ jobs:
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_zram-swap=y
           CONFIG_PACKAGE_luci-app-watchcat=y
+          # Mesh: full wpad (802.11s + 802.11r) instead of wpad-basic, plus mesh/roaming tools
+          # CONFIG_PACKAGE_wpad-basic-mbedtls is not set
+          CONFIG_PACKAGE_wpad-mbedtls=y
+          CONFIG_PACKAGE_kmod-batman-adv=y
+          CONFIG_PACKAGE_batctl-default=y
+          CONFIG_PACKAGE_luci-proto-batman-adv=y
+          CONFIG_PACKAGE_usteer=y
+          CONFIG_PACKAGE_luci-app-usteer=y
           EOF
           sed -i 's/^[ \t]*//' .config
           make defconfig
           grep -E "DEVICE_${DEVICE}|CONFIG_VERSION_NUMBER|PACKAGE_kmod-ath11k=" .config
+          # Fail early if any wanted package didn't make it into the config
+          for p in luci zram-swap luci-app-watchcat wpad-mbedtls kmod-batman-adv batctl-default luci-proto-batman-adv usteer luci-app-usteer; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || { echo "MISSING: $p"; exit 1; }
+          done
+          ! grep -q "^CONFIG_PACKAGE_wpad-basic-mbedtls=y" .config || { echo "wpad-basic still selected"; exit 1; }
+          echo "PACKAGES OK"
 
       - name: Download sources
         working-directory: openwrt
@@ -100,6 +114,7 @@ jobs:
         run: |
           mkdir -p out
           cp openwrt/bin/targets/$TARGET/$SUBTARGET/*${DEVICE}*sysupgrade* out/
+          cp openwrt/bin/targets/$TARGET/$SUBTARGET/*${DEVICE}*factory* out/
           find openwrt/bin -name 'kmod-ath11k*.apk' -exec cp {} out/ \;
           (cd out && sha256sum * > sha256sums.txt)
           ls -la out
@@ -114,6 +129,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v${{ inputs.openwrt_version }}-ath11kfix-${{ github.run_number }}"
-          gh release create "$TAG" out/* --title "MX4200 v1 · OpenWrt ${{ inputs.openwrt_version }} + ath11k RX ring fix (#${{ github.run_number }})" \
-            --notes "Official OpenWrt ${{ inputs.openwrt_version }} config for Linksys MX4200 v1, plus a patch halving five ath11k RX/monitor ring sizes (refill buffer kept at 2048) to stop RAM exhaustion (openwrt/openwrt#24154). Not an official build. Flash the *sysupgrade.bin* from an existing OpenWrt install, keeping settings."
+          TAG="v${{ inputs.openwrt_version }}-ath11kfix-mesh-${{ github.run_number }}"
+          gh release create "$TAG" out/* --title "MX4200 v1 · OpenWrt ${{ inputs.openwrt_version }} + ath11k RX ring fix + mesh (#${{ github.run_number }})" \
+            --notes "Official OpenWrt ${{ inputs.openwrt_version }} config for Linksys MX4200 v1, plus a patch halving five ath11k RX/monitor ring sizes (refill buffer kept at 2048) to stop RAM exhaustion (openwrt/openwrt#24154). Includes LuCI, zram-swap, watchcat, full wpad-mbedtls (802.11s/802.11r), batman-adv, usteer. Not an official build. From OpenWrt: flash *sysupgrade.bin* keeping settings. From Linksys stock firmware: upload *factory.bin* via the Linksys firmware page."
